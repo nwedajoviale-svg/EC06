@@ -1,0 +1,18 @@
+pipeline {
+    agent any
+
+    stages {
+        stage('Cloner') {
+            steps {
+                echo 'Code déjà cloné par Jenkins'
+            }
+        }
+
+        stage('Exécution des tests') {
+            steps {
+                bat '"C:\\Users\\HP USER\\AppData\\Local\\Programs\\Python\\Python314\\python.exe" testuni.py'
+            }
+        }
+    }
+}
+
