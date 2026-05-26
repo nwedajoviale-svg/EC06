@@ -1,0 +1,116 @@
+# Définition des étapes (stages) du pipeline dans l'ordre chronologique
+stages:
+  - build
+  - test
+  - quality
+  - package
+  - push
+  - deploy_staging
+  - deploy_production
+
+# Variables globales
+variables:
+  DOCKER_IMAGE_NAME: "registry.internal/mon-app"
+  DOCKER_TAG: "$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
+
+# 1. Étape de Build (Compilation)
+build_job:
+  stage: build
+  image: node:18-alpine # Exemple pour une application Node.js
+  script:
+    - npm install
+    - npm run build
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - dist/ # Sauvegarde de l'artéfact compilé pour les étapes suivantes
+  only:
+    - merge_requests
+    - main
+    - tags
+
+# 2. Étape de Tests Unitaires (Condition : Couverture >= 80%)
+unit_tests_job:
+  stage: test
+  image: node:18-alpine
+  script:
+    - npm run test:coverage # Génère un rapport de couverture
+  coverage: '/All files[^|]*\|[^|]*\|[^|]*\|[^|]*\| *(\d+.\d+)/'
+  allow_failure: false # Principe "Fail Fast" : si les tests échouent, le pipeline s'arrête
+  only:
+    - merge_requests
+    - main
+    - tags
+
+# 3. Étape d'Analyse Qualité (SonarQube)
+sonarqube_job:
+  stage: quality
+  image: sonarsource/sonar-scanner-cli:latest
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+  script:
+    - sonar-scanner -Dsonar.projectKey=mon_projet -Dsonar.sources=dist/ -Dsonar.host.url=$SONAR_URL -Dsonar.login=$SONAR_TOKEN
+  allow_failure: false # Aucun bug bloquant toléré (Condition de passage strict)
+  only:
+    - main
+    - tags
+
+# 4. Étape de Build de l'image Docker
+docker_build_job:
+  stage: package
+  image: docker:24.0.5
+  services:
+    - docker:24.0.5-dind
+  script:
+    - docker build -t $DOCKER_IMAGE_NAME:$DOCKER_TAG .
+    - docker save $DOCKER_IMAGE_NAME:$DOCKER_TAG > app_image.tar
+  artifacts:
+    expire_in: 1 day
+    paths:
+      - app_image.tar
+  only:
+    - main
+    - tags
+
+# 5. Étape de Push dans le Registre (Condition : Scan de sécurité OK)
+push_registry_job:
+  stage: push
+  image: docker:24.0.5
+  services:
+    - docker:24.0.5-dind
+  script:
+    - docker load < app_image.tar
+    - echo "$REGISTRY_PASSWORD" | docker login registry.internal -u "$REGISTRY_USER" --password-stdin
+    - docker push $DOCKER_IMAGE_NAME:$DOCKER_TAG
+  only:
+    - main
+    - tags
+
+# 6. Déploiement en Staging (Automatique sur la branche main)
+deploy_staging_job:
+  stage: deploy_staging
+  image: alpine:latest
+  script:
+    - apk add --no-cache openssh-client
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY_STAGING" | tr -d '\r' | ssh-add -
+    - ssh -o StrictHostKeyChecking=no deploy@10.40.0.10 "docker pull $DOCKER_IMAGE_NAME:$DOCKER_TAG && docker run -d -p 8080:8080 $DOCKER_IMAGE_NAME:$DOCKER_TAG"
+  environment:
+    name: staging
+  only:
+    - main
+
+# 7. Déploiement en Production (Manuel, uniquement sur Tag Git)
+deploy_production_job:
+  stage: deploy_production
+  image: alpine:latest
+  script:
+    - apk add --no-cache openssh-client
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY_PRODUCTION" | tr -d '\r' | ssh-add -
+    - ssh -o StrictHostKeyChecking=no deploy@10.50.0.21 "docker pull $DOCKER_IMAGE_NAME:$DOCKER_TAG && docker run -d -p 8080:8080 $DOCKER_IMAGE_NAME:$DOCKER_TAG"
+  environment:
+    name: production
+  when: manual # Déclenchement manuel requis pour la validation Go/No-Go
+  only:
+    - tags
